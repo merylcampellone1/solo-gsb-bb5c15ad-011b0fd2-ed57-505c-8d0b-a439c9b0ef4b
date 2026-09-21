@@ -72,14 +72,18 @@ export function seedDemo(db: DB): DemoResult {
     return f.id;
   };
 
-  addAnnotation(db, find('不得过度收集'), '王法务', '「不得过度收集」的判定标准需要明确，建议补充实施细则或指引。');
-  addAnnotation(db, find('访问控制策略'), '李合规', '访问控制策略的基线需要安全团队给出，落地周期约两个月。');
-  addAnnotation(db, find('二十四小时'), '李合规', '报告时限从 48 小时压缩到 24 小时，应急预案和值班流程需要同步修订。');
-  addAnnotation(db, find('一万元以上十万元以下'), '张审计', '罚款额度是否与上位法冲突？需要法务出具意见。');
-  const resolvedId = addAnnotation(db, find('每年开展数据安全评估'), '王法务', '年度评估要求已与团队确认，无异议。');
-  if (resolvedId != null) {
-    db.prepare(`UPDATE annotations SET status = 'resolved' WHERE id = ?`).run(resolvedId);
-  }
+  const note = (fragId: number, author: string, content: string): number => {
+    const r = addAnnotation(db, fragId, author, content);
+    if (r.status !== 'ok') throw new Error(`示例数据异常：批注创建失败（${r.status}）`);
+    return r.id;
+  };
+
+  note(find('不得过度收集'), '王法务', '「不得过度收集」的判定标准需要明确，建议补充实施细则或指引。');
+  note(find('访问控制策略'), '李合规', '访问控制策略的基线需要安全团队给出，落地周期约两个月。');
+  note(find('二十四小时'), '李合规', '报告时限从 48 小时压缩到 24 小时，应急预案和值班流程需要同步修订。');
+  note(find('一万元以上十万元以下'), '张审计', '罚款额度是否与上位法冲突？需要法务出具意见。');
+  const resolvedId = note(find('每年开展数据安全评估'), '王法务', '年度评估要求已与团队确认，无异议。');
+  db.prepare(`UPDATE annotations SET status = 'resolved' WHERE id = ?`).run(resolvedId);
 
   const r3 = importVersion(db, projectId, 'v3.0 正式发布稿', V3);
 

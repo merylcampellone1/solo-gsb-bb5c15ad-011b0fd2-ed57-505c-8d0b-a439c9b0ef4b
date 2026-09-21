@@ -6,6 +6,13 @@ import {
   importVersion,
   addAnnotation,
   getComparisonDetail,
+  saveFragmentDecision,
+  sealComparison,
+  getSealBlockers,
+  updateAnnotation,
+  deleteAnnotation,
+  FRAGMENT_DECISIONS,
+  type FragmentDecision,
 } from './service';
 import { toCsv, toMarkdown } from './exporter';
 import { seedDemo } from './demo';
@@ -22,6 +29,10 @@ const VALID_STATUS = new Set(['open', 'resolved', 'pending_review']);
 
 function badRequest(res: express.Response, message: string) {
   return res.status(400).json({ error: message });
+}
+
+function conflict(res: express.Response, message: string, extra?: Record<string, unknown>) {
+  return res.status(409).json({ error: message, ...(extra ?? {}) });
 }
 
 function notFound(res: express.Response, message = '资源不存在') {
@@ -65,9 +76,10 @@ app.get('/api/projects/:id', (req, res) => {
     .all(id);
   const comparisons = db
     .prepare(
-      `SELECT c.id, c.created_at,
+      `SELECT c.id, c.created_at, c.sealed_by, c.sealed_at,
               ov.label AS old_label, nv.label AS new_label,
               (SELECT COUNT(*) FROM fragments f WHERE f.comparison_id = c.id)  AS fragment_count,
+              (SELECT COUNT(*) FROM fragments f WHERE f.comparison_id = c.id AND f.decision IS NULL) AS undecided_count,
               (SELECT COUNT(*) FROM annotations a WHERE a.comparison_id = c.id) AS annotation_count,
               (SELECT COUNT(*) FROM annotations a WHERE a.comparison_id = c.id AND a.status <> 'resolved') AS open_count
          FROM comparisons c
@@ -144,10 +156,77 @@ app.post('/api/fragments/:id/annotations', (req, res) => {
   const content = String(req.body?.content ?? '').trim();
   if (!author) return badRequest(res, '作者必填');
   if (!content) return badRequest(res, '批注内容必填');
-  const id = addAnnotation(db, Number(req.params.id), author, content);
-  if (id == null) return notFound(res, '片段不存在');
-  const annotation = db.prepare('SELECT * FROM annotations WHERE id = ?').get(id);
+  if (author.length > 50) return badRequest(res, '作者姓名过长（最多 50 字）');
+  const result = addAnnotation(db, Number(req.params.id), author, content);
+  if (result.status === 'not_found') return notFound(res, '片段不存在');
+  if (result.status === 'sealed') return conflict(res, '该比对已封存，禁止新增批注');
+  const annotation = db.prepare('SELECT * FROM annotations WHERE id = ?').get(result.id);
   res.status(201).json({ annotation });
+});
+
+// ---------- 片段审阅结论 ----------
+app.patch('/api/fragments/:id/decision', (req, res) => {
+  const fragmentId = Number(req.params.id);
+  const rawDecision = String(req.body?.decision ?? '');
+  if (!FRAGMENT_DECISIONS.includes(rawDecision as FragmentDecision)) {
+    return badRequest(res, '结论必须为 accepted / rejected / deferred 之一');
+  }
+  const decision = rawDecision as FragmentDecision;
+  let reason: string | null = null;
+  if (req.body?.reason !== undefined && req.body?.reason !== null) {
+    reason = String(req.body.reason).trim();
+  }
+  if (decision === 'deferred' && (reason == null || !reason)) {
+    return badRequest(res, '暂缓时必须填写暂缓理由');
+  }
+  if (reason != null && reason.length > 1000) {
+    return badRequest(res, '暂缓理由过长（最多 1000 字）');
+  }
+  let decidedBy: string | null = null;
+  if (req.body?.decided_by !== undefined && req.body?.decided_by !== null) {
+    decidedBy = String(req.body.decided_by).trim();
+    if (decidedBy.length > 50) return badRequest(res, '结论提出人姓名过长（最多 50 字）');
+  }
+
+  const result = saveFragmentDecision(db, fragmentId, decision, reason, decidedBy);
+  if (result.status === 'not_found') return notFound(res, '片段不存在');
+  if (result.status === 'sealed') return conflict(res, '该比对已封存，禁止修改片段结论');
+  if (result.status === 'reason_required') return badRequest(res, '暂缓时必须填写暂缓理由');
+
+  const fragment = db
+    .prepare('SELECT id, decision, decision_reason, decided_by, decided_at FROM fragments WHERE id = ?')
+    .get(fragmentId);
+  res.json({ fragment });
+});
+
+// ---------- 审阅封存 ----------
+app.get('/api/comparisons/:id/seal/blockers', (req, res) => {
+  const comparisonId = Number(req.params.id);
+  const cmpRow = db.prepare('SELECT sealed_at FROM comparisons WHERE id = ?').get(comparisonId) as
+    | { sealed_at: string | null }
+    | undefined;
+  if (!cmpRow) return notFound(res, '比对不存在');
+  res.json({
+    sealed: cmpRow.sealed_at != null,
+    blockers: cmpRow.sealed_at != null ? [] : getSealBlockers(db, comparisonId),
+  });
+});
+
+app.post('/api/comparisons/:id/seal', (req, res) => {
+  const comparisonId = Number(req.params.id);
+  const sealedBy = String(req.body?.sealed_by ?? '').trim();
+  if (!sealedBy) return badRequest(res, '封存人必填');
+  if (sealedBy.length > 50) return badRequest(res, '封存人姓名过长（最多 50 字）');
+
+  const result = sealComparison(db, comparisonId, sealedBy);
+  if (result.status === 'not_found') return notFound(res, '比对不存在');
+  if (result.status === 'already_sealed') {
+    return conflict(res, '该比对已封存，无法重复封存', { sealed: result.sealed });
+  }
+  if (result.status === 'blocked') {
+    return conflict(res, '仍存在未完成的审阅项，无法封存', { blockers: result.blockers });
+  }
+  res.status(201).json({ sealed: result.sealed });
 });
 
 app.patch('/api/annotations/:id', (req, res) => {
@@ -164,24 +243,28 @@ app.patch('/api/annotations/:id', (req, res) => {
   if (status !== undefined && !VALID_STATUS.has(status)) {
     return badRequest(res, '非法的批注状态（open / resolved / pending_review）');
   }
-  if (content !== undefined && !String(content).trim()) {
-    return badRequest(res, '批注内容不能为空');
+  let trimmedContent: string | null = null;
+  if (content !== undefined) {
+    trimmedContent = String(content).trim();
+    if (!trimmedContent) return badRequest(res, '批注内容不能为空');
   }
-  db.prepare(
-    `UPDATE annotations
-        SET status = ?, content = ?, updated_at = datetime('now', 'localtime')
-      WHERE id = ?`
-  ).run(
-    status ?? ann.status,
-    content !== undefined ? String(content).trim() : ann.content,
-    id
+  const result = updateAnnotation(
+    db,
+    id,
+    status !== undefined ? String(status) : null,
+    trimmedContent
   );
+  if (result.status === 'not_found') return notFound(res, '批注不存在');
+  if (result.status === 'sealed') {
+    return conflict(res, '该比对已封存，禁止编辑批注或变更批注状态');
+  }
   res.json({ annotation: db.prepare('SELECT * FROM annotations WHERE id = ?').get(id) });
 });
 
 app.delete('/api/annotations/:id', (req, res) => {
-  const info = db.prepare('DELETE FROM annotations WHERE id = ?').run(Number(req.params.id));
-  if (info.changes === 0) return notFound(res, '批注不存在');
+  const result = deleteAnnotation(db, Number(req.params.id));
+  if (result.status === 'not_found') return notFound(res, '批注不存在');
+  if (result.status === 'sealed') return conflict(res, '该比对已封存，禁止删除批注');
   res.status(204).end();
 });
 

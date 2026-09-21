@@ -4,6 +4,7 @@
 
 const STATUS_LABEL = { open: '待处理', resolved: '已解决', pending_review: '待复核' };
 const TYPE_LABEL = { added: '新增', removed: '删除', changed: '修改' };
+const DECISION_LABEL = { accepted: '接受变更', rejected: '拒绝变更', deferred: '暂缓' };
 
 const app = document.getElementById('app');
 
@@ -48,6 +49,11 @@ function toast(msg, isErr = false) {
 const lastAuthor = {
   get: () => localStorage.getItem('review-author') || '',
   set: (v) => localStorage.setItem('review-author', v),
+};
+
+const lastSealer = {
+  get: () => localStorage.getItem('review-sealer') || '',
+  set: (v) => localStorage.setItem('review-sealer', v),
 };
 
 /* ================= 视图：项目列表 ================= */
@@ -106,11 +112,19 @@ async function renderProject(id) {
       <h3>比对记录</h3>
       ${comparisons.length === 0 ? '<p class="empty">导入两个以上版本后，这里会列出差异比对。</p>' : `
         <div class="cards">${comparisons.map((c) => `
-          <a class="card" href="#/comparisons/${c.id}">
-            <div class="card-title">${esc(c.old_label)} → ${esc(c.new_label)}</div>
+          <a class="card${c.sealed_at ? ' sealed' : ''}" href="#/comparisons/${c.id}">
+            <div class="card-title">
+              ${c.sealed_at
+                ? '<span class="seal-badge">🔒 已封存</span>'
+                : '<span class="draft-badge">📝 草稿</span>'}
+              ${esc(c.old_label)} → ${esc(c.new_label)}
+            </div>
             <div class="card-meta">${c.fragment_count} 处差异 · ${c.annotation_count} 条批注
-              ${c.open_count > 0 ? ` · <b class="warn">${c.open_count} 条待办</b>` : ''}</div>
-            <div class="card-meta dim">${esc(c.created_at)}</div>
+              ${c.open_count > 0 ? ` · <b class="warn">${c.open_count} 条批注待办</b>` : ''}
+              ${!c.sealed_at && c.undecided_count > 0 ? ` · <b class="warn">${c.undecided_count} 个片段未结论</b>` : ''}</div>
+            <div class="card-meta dim">
+              ${c.sealed_at ? `封存人 ${esc(c.sealed_by || '（未署名）')} · ${esc(c.sealed_at)}` : esc(c.created_at)}
+            </div>
           </a>`).join('')}</div>`}
     </section>`;
 }
@@ -131,10 +145,10 @@ async function renderComparison(id) {
   drawComparison();
 }
 
-function allAnnotations() {
+function allAnnotations(data = cmp.data) {
   const anns = [];
-  for (const f of cmp.data.fragments) anns.push(...f.annotations);
-  anns.push(...cmp.data.unanchored);
+  for (const f of data.fragments) anns.push(...f.annotations);
+  anns.push(...data.unanchored);
   return anns;
 }
 
@@ -147,6 +161,7 @@ function visibleAnnotations(anns) {
 }
 
 function annHtml(a) {
+  const sealed = !!cmp.data.comparison.sealed_at;
   const migrated = a.migrated_from != null
     ? `<span class="migrated" title="从上一轮比对自动迁移">⤳ 迁移${a.similarity != null ? ` · 相似度 ${(a.similarity * 100).toFixed(0)}%` : ''}</span>`
     : '';
@@ -159,17 +174,62 @@ function annHtml(a) {
         <span class="dim">${esc(a.updated_at)}</span>
       </div>
       <div class="ann-body">${esc(a.content)}</div>
+      ${sealed ? '' : `
       <div class="ann-actions">
         <select class="ann-status" data-id="${a.id}" title="更新状态">
           ${Object.entries(STATUS_LABEL).map(([v, l]) =>
             `<option value="${v}" ${v === a.status ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <button class="btn small danger" data-action="delete-annotation" data-id="${a.id}">删除</button>
+      </div>`}
+    </div>`;
+}
+
+function decisionHtml(f) {
+  const sealed = !!cmp.data.comparison.sealed_at;
+  if (sealed) {
+    if (!f.decision) return '<div class="decision-box dc-none">封存时该片段无结论记录</div>';
+    const who = f.decided_by ? `（${esc(f.decided_by)}${f.decided_at ? ` · ${esc(f.decided_at)}` : ''}）` : '';
+    return `
+      <div class="decision-box dc-${f.decision}">
+        <span class="badge dc-${f.decision}">${DECISION_LABEL[f.decision]}</span>
+        ${f.decision === 'deferred' && f.decision_reason
+          ? `<span class="decision-reason">暂缓理由：${esc(f.decision_reason)}</span>` : ''}
+        <span class="dim">${who}</span>
+      </div>`;
+  }
+  const options = [
+    { v: 'accepted', l: '接受变更' },
+    { v: 'rejected', l: '拒绝变更' },
+    { v: 'deferred', l: '暂缓（需填理由）' },
+  ];
+  return `
+    <div class="decision-box" data-fragment="${f.id}">
+      <span class="decision-label">审阅结论：</span>
+      <div class="decision-opts" role="radiogroup">
+        ${options.map((o) => `
+          <label class="decision-opt dc-${o.v}${f.decision === o.v ? ' picked' : ''}">
+            <input type="radio" class="decision-radio" name="decision-${f.id}" value="${o.v}"
+              ${f.decision === o.v ? 'checked' : ''}>
+            ${o.l}
+          </label>`).join('')}
       </div>
+      <div class="decision-detail" ${f.decision === 'deferred' ? '' : 'hidden'}>
+        <input class="decision-reason-input" maxlength="1000" placeholder="必须填写暂缓理由，保存后生效"
+          value="${esc(f.decision_reason ?? '')}">
+      </div>
+      <div class="decision-actions">
+        <button class="btn small primary" data-action="save-decision" data-id="${f.id}">保存结论</button>
+        <span class="dim">切换选项后点击保存；暂缓需先填写理由</span>
+      </div>
+      ${f.decision && f.decided_by
+        ? `<span class="dim">当前结论提出人：${esc(f.decided_by)}${f.decided_at ? ` · ${esc(f.decided_at)}` : ''}</span>`
+        : ''}
     </div>`;
 }
 
 function fragHtml(f) {
+  const sealed = !!cmp.data.comparison.sealed_at;
   const anns = visibleAnnotations(f.annotations);
   const pos = [
     f.old_start != null ? `旧¶${f.old_start}` : null,
@@ -180,15 +240,63 @@ function fragHtml(f) {
       <div class="frag-head">
         <span class="badge ft-${f.type}">${TYPE_LABEL[f.type]}</span>
         <span class="dim">片段 #${f.ord}${pos ? ` · ${pos}` : ''} · ${f.annotations.length} 条批注</span>
+        ${f.decision ? `<span class="badge dc-${f.decision}">${DECISION_LABEL[f.decision]}</span>` : '<span class="badge dc-none">未结论</span>'}
       </div>
       ${f.old_text != null ? `<pre class="frag-text old">${esc(f.old_text)}</pre>` : ''}
       ${f.new_text != null ? `<pre class="frag-text new">${esc(f.new_text)}</pre>` : ''}
+      ${decisionHtml(f)}
       <div class="anns">${anns.map(annHtml).join('')}</div>
+      ${sealed ? '' : `
       <form class="ann-form" data-fragment="${f.id}">
         <input name="author" required maxlength="50" placeholder="作者" value="${esc(lastAuthor.get())}">
         <input name="content" required maxlength="2000" placeholder="写下审阅意见…">
         <button class="btn small primary" type="submit">批注</button>
-      </form>
+      </form>`}
+    </div>`;
+}
+
+function sealBlockers(data) {
+  const blockers = [];
+  for (const f of data.fragments) {
+    if (!f.decision) blockers.push({ kind: 'undecided_fragment', message: `片段 #${f.ord} 尚未作出审阅结论` });
+  }
+  for (const a of allAnnotations(data)) {
+    if (a.status === 'open') {
+      blockers.push({ kind: 'open_annotation', message: `存在未解决批注 #${a.id}${a.fragment_id == null ? '（位于待复核区）' : ''}` });
+    } else if (a.status === 'pending_review') {
+      blockers.push({ kind: 'pending_review_annotation', message: `存在待复核批注 #${a.id}${a.fragment_id == null ? '（位于待复核区）' : ''}` });
+    }
+  }
+  return blockers;
+}
+
+function sealPanelHtml(data) {
+  const blockers = sealBlockers(data);
+  const undecided = data.stats.decisions.undecided;
+  const openAnn = data.stats.annotations.open;
+  const pendingAnn = data.stats.annotations.pending_review;
+  const canSeal = blockers.length === 0;
+  const preview = blockers.slice(0, 8).map((b) => `<li>${esc(b.message)}</li>`).join('');
+  const more = blockers.length > 8 ? `<li class="dim">…另有 ${blockers.length - 8} 项</li>` : '';
+  return `
+    <div class="seal-panel${canSeal ? ' ready' : ''}">
+      <div class="seal-summary">
+        <h3>🔖 审阅封存</h3>
+        <div class="seal-counts">
+          <span class="${undecided > 0 ? 'warn' : 'ok'}">未作结论片段：${undecided}</span>
+          <span class="${openAnn > 0 ? 'warn' : 'ok'}">未解决批注：${openAnn}</span>
+          <span class="${pendingAnn > 0 ? 'warn' : 'ok'}">待复核批注：${pendingAnn}</span>
+        </div>
+      </div>
+      ${blockers.length > 0 ? `
+        <ul class="blocker-list">${preview}${more}</ul>
+        <p class="hint">所有片段均已有结论，且不存在未解决或待复核批注时，方可封存。</p>` : ''}
+      <div class="seal-form-row">
+        <input id="seal-by" maxlength="50" placeholder="封存人姓名" value="${esc(lastSealer.get())}">
+        <button class="btn primary" data-action="seal" data-id="${data.comparison.id}" ${canSeal ? '' : 'disabled'}>
+          ${canSeal ? '确认封存' : '尚有阻塞项，无法封存'}
+        </button>
+      </div>
     </div>`;
 }
 
@@ -212,21 +320,36 @@ function drawComparison() {
     <section class="panel">
       <div class="panel-head wrap">
         <h2>${esc(comparison.old_label)} → ${esc(comparison.new_label)}</h2>
-        <div class="export-bar">
-          导出：
-          <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=json">JSON</a>
-          <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=csv">CSV</a>
-          <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=md">Markdown</a>
+        <div class="head-side">
+          ${comparison.sealed_at
+            ? '<span class="seal-badge big">🔒 已封存</span>'
+            : '<span class="draft-badge big">📝 草稿</span>'}
+          <div class="export-bar">
+            导出：
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=json">JSON</a>
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=csv">CSV</a>
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=md">Markdown</a>
+          </div>
         </div>
       </div>
+
+      ${comparison.sealed_at ? `
+        <div class="sealed-banner">
+          🔒 本比对已于 <b>${esc(comparison.sealed_at)}</b> 由 <b>${esc(comparison.sealed_by || '（未署名）')}</b> 封存。
+          封存后禁止修改片段结论，禁止新增、编辑、改状态或删除批注。
+        </div>` : sealPanelHtml(cmp.data)}
 
       <div class="stats">
         <span class="chip ft-added">新增 ${stats.added}</span>
         <span class="chip ft-removed">删除 ${stats.removed}</span>
         <span class="chip ft-changed">修改 ${stats.changed}</span>
-        <span class="chip st-open">待处理 ${stats.annotations.open}</span>
+        <span class="chip dc-accepted">接受 ${stats.decisions.accepted}</span>
+        <span class="chip dc-rejected">拒绝 ${stats.decisions.rejected}</span>
+        <span class="chip dc-deferred">暂缓 ${stats.decisions.deferred}</span>
+        <span class="chip dc-none${stats.decisions.undecided > 0 ? ' hot' : ''}">未作结论 ${stats.decisions.undecided}</span>
+        <span class="chip st-open${stats.annotations.open > 0 ? ' hot' : ''}">未解决批注 ${stats.annotations.open}</span>
+        <span class="chip st-pending_review${stats.annotations.pending_review > 0 ? ' hot' : ''}">待复核批注 ${stats.annotations.pending_review}</span>
         <span class="chip st-resolved">已解决 ${stats.annotations.resolved}</span>
-        <span class="chip st-pending_review">待复核 ${stats.annotations.pending_review}</span>
       </div>
 
       <div class="filter-bar">
@@ -331,6 +454,65 @@ document.addEventListener('click', async (e) => {
       await api('DELETE', `/api/annotations/${btn.dataset.id}`);
       await renderComparison(cmp.id);
       toast('批注已删除');
+    } else if (action === 'save-decision') {
+      const box = btn.closest('.decision-box');
+      const checked = box.querySelector('input[type=radio]:checked');
+      const fragmentId = box.dataset.fragment;
+      if (!checked) {
+        toast('请先选择「接受变更 / 拒绝变更 / 暂缓」', true);
+        return;
+      }
+      const decision = checked.value;
+      const reasonInput = box.querySelector('.decision-reason-input');
+      const reason = reasonInput ? reasonInput.value.trim() : '';
+      if (decision === 'deferred' && !reason) {
+        toast('暂缓必须填写理由', true);
+        reasonInput?.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('PATCH', `/api/fragments/${fragmentId}/decision`, {
+          decision,
+          reason: decision === 'deferred' ? reason : null,
+          decided_by: lastAuthor.get() || null,
+        });
+        toast('片段结论已保存');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'seal') {
+      const input = document.getElementById('seal-by');
+      const sealedBy = input.value.trim();
+      if (!sealedBy) {
+        toast('请填写封存人姓名', true);
+        input.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/comparisons/${btn.dataset.id}/seal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sealed_by: sealedBy }),
+        });
+        const j = await res.json().catch(() => null);
+        if (!res.ok) {
+          if (j?.blockers?.length) {
+            toast(`封存被阻塞：${j.blockers[0].message} 等 ${j.blockers.length} 项`, true);
+          } else {
+            toast(j?.error || `封存失败（${res.status}）`, true);
+          }
+          await renderComparison(cmp.id);
+          return;
+        }
+        lastSealer.set(sealedBy);
+        toast('已封存：片段结论与批注均已锁定');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
     }
   } catch (err) {
     toast(err.message, true);
@@ -340,7 +522,14 @@ document.addEventListener('click', async (e) => {
 document.addEventListener('change', async (e) => {
   const t = e.target;
   try {
-    if (t.classList.contains('ann-status')) {
+    if (t.classList.contains('decision-radio')) {
+      const box = t.closest('.decision-box');
+      const detail = box.querySelector('.decision-detail');
+      detail.hidden = t.value !== 'deferred';
+      box.querySelectorAll('.decision-opt').forEach((el) => {
+        el.classList.toggle('picked', el.querySelector('input').checked);
+      });
+    } else if (t.classList.contains('ann-status')) {
       await api('PATCH', `/api/annotations/${t.dataset.id}`, { status: t.value });
       await renderComparison(cmp.id);
       toast('状态已更新');

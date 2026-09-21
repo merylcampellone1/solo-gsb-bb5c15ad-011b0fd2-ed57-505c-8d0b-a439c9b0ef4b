@@ -70,14 +70,25 @@ export function importVersion(db: DB, projectId: number, label: string, content:
   return tx();
 }
 
-/** 在差异片段上创建批注，锚点取片段当前（新）文本 */
-export function addAnnotation(db: DB, fragmentId: number, author: string, content: string): number | null {
+/** 在差异片段上创建批注，锚点取片段当前（新）文本。
+ *  已封存的比对禁止新增批注（sealed）；片段不存在返回 null。 */
+export function addAnnotation(
+  db: DB,
+  fragmentId: number,
+  author: string,
+  content: string
+): { status: 'ok'; id: number } | { status: 'not_found' } | { status: 'sealed' } {
   const frag = db
-    .prepare('SELECT id, comparison_id, old_text, new_text FROM fragments WHERE id = ?')
+    .prepare(
+      `SELECT f.id, f.comparison_id, f.old_text, f.new_text, c.sealed_at
+         FROM fragments f JOIN comparisons c ON c.id = f.comparison_id
+        WHERE f.id = ?`
+    )
     .get(fragmentId) as
-    | { id: number; comparison_id: number; old_text: string | null; new_text: string | null }
+    | { id: number; comparison_id: number; old_text: string | null; new_text: string | null; sealed_at: string | null }
     | undefined;
-  if (!frag) return null;
+  if (!frag) return { status: 'not_found' };
+  if (frag.sealed_at != null) return { status: 'sealed' };
   const anchor = frag.new_text ?? frag.old_text ?? '';
   const info = db
     .prepare(
@@ -85,7 +96,194 @@ export function addAnnotation(db: DB, fragmentId: number, author: string, conten
        VALUES (?, ?, ?, ?, 'open', ?)`
     )
     .run(frag.comparison_id, fragmentId, author, content, anchor);
-  return Number(info.lastInsertRowid);
+  return { status: 'ok', id: Number(info.lastInsertRowid) };
+}
+
+export type FragmentDecision = 'accepted' | 'rejected' | 'deferred';
+export const FRAGMENT_DECISIONS: readonly FragmentDecision[] = ['accepted', 'rejected', 'deferred'];
+
+export interface Blocker {
+  kind: 'undecided_fragment' | 'open_annotation' | 'pending_review_annotation';
+  message: string;
+  fragment_ord?: number;
+  annotation_id?: number;
+}
+
+export type SaveDecisionResult =
+  | { status: 'ok' }
+  | { status: 'not_found' }
+  | { status: 'sealed' }
+  | { status: 'reason_required' };
+
+/**
+ * 保存片段审阅结论：接受变更 / 拒绝变更 / 暂缓。
+ * 暂缓（deferred）必须填写理由。已封存的比对禁止修改结论。
+ */
+export function saveFragmentDecision(
+  db: DB,
+  fragmentId: number,
+  decision: FragmentDecision,
+  reason: string | null,
+  decidedBy: string | null
+): SaveDecisionResult {
+  const frag = db
+    .prepare(
+      `SELECT f.id, c.sealed_at
+         FROM fragments f JOIN comparisons c ON c.id = f.comparison_id
+        WHERE f.id = ?`
+    )
+    .get(fragmentId) as { id: number; sealed_at: string | null } | undefined;
+  if (!frag) return { status: 'not_found' };
+  if (frag.sealed_at != null) return { status: 'sealed' };
+  if (decision === 'deferred' && (reason == null || !reason.trim())) {
+    return { status: 'reason_required' };
+  }
+  db.prepare(
+    `UPDATE fragments
+        SET decision = ?, decision_reason = ?, decided_by = ?,
+            decided_at = datetime('now', 'localtime')
+      WHERE id = ?`
+  ).run(
+    decision,
+    decision === 'deferred' ? reason!.trim() : null,
+    decidedBy,
+    fragmentId
+  );
+  return { status: 'ok' };
+}
+
+/** 汇总封存前的全部阻塞项：未作结论的片段、未解决 / 待复核批注 */
+export function getSealBlockers(db: DB, comparisonId: number): Blocker[] {
+  const blockers: Blocker[] = [];
+  const undecided = db
+    .prepare(`SELECT ord FROM fragments WHERE comparison_id = ? AND decision IS NULL ORDER BY ord`)
+    .all(comparisonId) as Array<{ ord: number }>;
+  for (const f of undecided) {
+    blockers.push({
+      kind: 'undecided_fragment',
+      fragment_ord: f.ord,
+      message: `片段 #${f.ord} 尚未作出审阅结论`,
+    });
+  }
+  const anns = db
+    .prepare(
+      `SELECT id, status, fragment_id
+         FROM annotations
+        WHERE comparison_id = ? AND status IN ('open', 'pending_review')
+        ORDER BY id`
+    )
+    .all(comparisonId) as Array<{ id: number; status: string; fragment_id: number | null }>;
+  for (const a of anns) {
+    const suffix = a.fragment_id == null ? '（位于待复核区）' : '';
+    blockers.push({
+      kind: a.status === 'open' ? 'open_annotation' : 'pending_review_annotation',
+      annotation_id: a.id,
+      message:
+        a.status === 'open'
+          ? `存在未解决批注 #${a.id}${suffix}`
+          : `存在待复核批注 #${a.id}${suffix}`,
+    });
+  }
+  return blockers;
+}
+
+export interface SealedComparison {
+  sealed_by: string;
+  sealed_at: string;
+}
+
+export type SealResult =
+  | { status: 'ok'; sealed: SealedComparison }
+  | { status: 'not_found' }
+  | { status: 'already_sealed'; sealed: SealedComparison }
+  | { status: 'blocked'; blockers: Blocker[] };
+
+/**
+ * 封存比对：服务端在单个事务内再次校验
+ *（全部片段已有结论、不存在未解决 / 待复核批注），
+ * 任何阻塞项都会回滚并返回明细。
+ */
+export function sealComparison(
+  db: DB,
+  comparisonId: number,
+  sealedBy: string
+): SealResult {
+  const tx = db.transaction((): SealResult => {
+    const cmpRow = db
+      .prepare('SELECT sealed_by, sealed_at FROM comparisons WHERE id = ?')
+      .get(comparisonId) as { sealed_by: string | null; sealed_at: string | null } | undefined;
+    if (!cmpRow) return { status: 'not_found' };
+    if (cmpRow.sealed_at != null) {
+      return {
+        status: 'already_sealed',
+        sealed: { sealed_by: cmpRow.sealed_by ?? '', sealed_at: cmpRow.sealed_at },
+      };
+    }
+
+    const blockers = getSealBlockers(db, comparisonId);
+    if (blockers.length > 0) return { status: 'blocked', blockers };
+
+    db.prepare(
+      `UPDATE comparisons
+          SET sealed_by = ?, sealed_at = datetime('now', 'localtime')
+        WHERE id = ? AND sealed_at IS NULL`
+    ).run(sealedBy, comparisonId);
+
+    const row = db
+      .prepare('SELECT sealed_by, sealed_at FROM comparisons WHERE id = ?')
+      .get(comparisonId) as { sealed_by: string; sealed_at: string };
+    return { status: 'ok', sealed: { sealed_by: row.sealed_by, sealed_at: row.sealed_at } };
+  });
+  return tx();
+}
+
+/** 批注是否处于已封存比对（用于编辑 / 改状态 / 删除前的写保护） */
+export function isAnnotationSealed(db: DB, annotationId: number): boolean | null {
+  const row = db
+    .prepare('SELECT c.sealed_at FROM annotations a JOIN comparisons c ON c.id = a.comparison_id WHERE a.id = ?')
+    .get(annotationId) as { sealed_at: string | null } | undefined;
+  if (!row) return null;
+  return row.sealed_at != null;
+}
+
+export type UpdateAnnotationResult = { status: 'ok' } | { status: 'not_found' } | { status: 'sealed' };
+
+/** 更新批注状态 / 内容，已封存的比对一律拒绝 */
+export function updateAnnotation(
+  db: DB,
+  annotationId: number,
+  status: string | null,
+  content: string | null
+): UpdateAnnotationResult {
+  const ann = db
+    .prepare(
+      `SELECT a.status, a.content, c.sealed_at
+         FROM annotations a JOIN comparisons c ON c.id = a.comparison_id
+        WHERE a.id = ?`
+    )
+    .get(annotationId) as
+    | { status: string; content: string; sealed_at: string | null }
+    | undefined;
+  if (!ann) return { status: 'not_found' };
+  if (ann.sealed_at != null) return { status: 'sealed' };
+  db.prepare(
+    `UPDATE annotations
+        SET status = ?, content = ?, updated_at = datetime('now', 'localtime')
+      WHERE id = ?`
+  ).run(status ?? ann.status, content ?? ann.content, annotationId);
+  return { status: 'ok' };
+}
+
+/** 删除批注，已封存的比对一律拒绝 */
+export function deleteAnnotation(
+  db: DB,
+  annotationId: number
+): { status: 'ok' } | { status: 'not_found' } | { status: 'sealed' } {
+  const sealed = isAnnotationSealed(db, annotationId);
+  if (sealed == null) return { status: 'not_found' };
+  if (sealed) return { status: 'sealed' };
+  db.prepare('DELETE FROM annotations WHERE id = ?').run(annotationId);
+  return { status: 'ok' };
 }
 
 export interface AnnotationRow {
@@ -112,6 +310,10 @@ export interface FragmentRow {
   old_start: number | null;
   new_start: number | null;
   anchor: string | null;
+  decision: FragmentDecision | null;
+  decision_reason: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
 }
 
 export interface ComparisonDetail {
@@ -121,6 +323,8 @@ export interface ComparisonDetail {
     project_name: string;
     old_label: string;
     new_label: string;
+    sealed_by: string | null;
+    sealed_at: string | null;
     created_at: string;
   };
   fragments: Array<FragmentRow & { annotations: AnnotationRow[] }>;
@@ -131,13 +335,20 @@ export interface ComparisonDetail {
     removed: number;
     changed: number;
     annotations: { open: number; resolved: number; pending_review: number; total: number };
+    decisions: {
+      accepted: number;
+      rejected: number;
+      deferred: number;
+      undecided: number;
+      total: number;
+    };
   };
 }
 
 export function getComparisonDetail(db: DB, comparisonId: number): ComparisonDetail | null {
   const comparison = db
     .prepare(
-      `SELECT c.id, c.project_id, c.created_at,
+      `SELECT c.id, c.project_id, c.created_at, c.sealed_by, c.sealed_at,
               p.name AS project_name,
               ov.label AS old_label,
               nv.label AS new_label
@@ -174,8 +385,13 @@ export function getComparisonDetail(db: DB, comparisonId: number): ComparisonDet
     removed: 0,
     changed: 0,
     annotations: { open: 0, resolved: 0, pending_review: 0, total: annotations.length },
+    decisions: { accepted: 0, rejected: 0, deferred: 0, undecided: 0, total: fragments.length },
   };
-  for (const f of fragments) stats[f.type]++;
+  for (const f of fragments) {
+    stats[f.type]++;
+    if (f.decision == null) stats.decisions.undecided++;
+    else stats.decisions[f.decision]++;
+  }
   for (const a of annotations) stats.annotations[a.status]++;
 
   return {

@@ -34,9 +34,15 @@ test('未解决批注迁移到最相近片段，无法匹配的标为待复核�
   const frag2 = frags.find((f) => f.new_text.includes('二十四小时'))!;
   const frag3 = frags.find((f) => f.new_text.includes('一万元'))!;
 
-  addAnnotation(db, frag2.id, '甲', '时限压缩需确认'); // v3 中第二条仍相近 → 应迁移
-  addAnnotation(db, frag3.id, '乙', '罚款额度待确认'); // v3 中第三条无变化 → 无片段 → 待复核
-  const resolvedId = addAnnotation(db, frag3.id, '丙', '已确认无异议')!;
+  const note = (fragId: number, author: string, content: string): number => {
+    const r = addAnnotation(db, fragId, author, content);
+    assert.equal(r.status, 'ok');
+    return r.status === 'ok' ? r.id : -1;
+  };
+
+  note(frag2.id, '甲', '时限压缩需确认'); // v3 中第二条仍相近 → 应迁移
+  note(frag3.id, '乙', '罚款额度待确认'); // v3 中第三条无变化 → 无片段 → 待复核
+  const resolvedId = note(frag3.id, '丙', '已确认无异议');
   db.prepare(`UPDATE annotations SET status = 'resolved' WHERE id = ?`).run(resolvedId);
 
   const r3 = importVersion(db, pid, 'v3', V3);
@@ -64,7 +70,8 @@ test('锚点与新片段完全一致时相似度为 1', () => {
     .prepare('SELECT * FROM fragments WHERE comparison_id = ?')
     .all(r2.comparisonId!) as Array<{ id: number; new_text: string }>;
   const frag2 = frags.find((f) => f.new_text.includes('二十四小时'))!;
-  addAnnotation(db, frag2.id, '甲', '待办');
+  const r = addAnnotation(db, frag2.id, '甲', '待办');
+  assert.equal(r.status, 'ok');
 
   // v3 与 v2 的第二条完全相同 → 该段无变化不会产生片段；
   // 构造一个 v3 仅修改第一条的场景，第二条批注应转待复核
