@@ -27,6 +27,9 @@ export function createSchema(db: DB): void {
       project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       old_version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
       new_version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+      sealed         INTEGER NOT NULL DEFAULT 0,
+      sealed_by      TEXT,
+      sealed_at      TEXT,
       created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
     );
     CREATE INDEX IF NOT EXISTS idx_comparisons_project ON comparisons(project_id);
@@ -40,7 +43,9 @@ export function createSchema(db: DB): void {
       new_text      TEXT,
       old_start     INTEGER,
       new_start     INTEGER,
-      anchor        TEXT
+      anchor        TEXT,
+      decision      TEXT CHECK (decision IN ('accepted', 'rejected', 'deferred')),
+      defer_reason  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_fragments_comparison ON fragments(comparison_id, ord);
 
@@ -70,5 +75,25 @@ export function openDb(dbPath: string): DB {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   createSchema(db);
+  migrateSchema(db);
   return db;
+}
+
+/** 为已存在的旧库补充新增列（新库由 createSchema 直接建全，此处为幂等空操作） */
+function migrateSchema(db: DB): void {
+  const ensureColumn = (table: string, column: string, ddl: string): void => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
+  };
+  ensureColumn('comparisons', 'sealed', 'sealed INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('comparisons', 'sealed_by', 'sealed_by TEXT');
+  ensureColumn('comparisons', 'sealed_at', 'sealed_at TEXT');
+  ensureColumn(
+    'fragments',
+    'decision',
+    `decision TEXT CHECK (decision IN ('accepted', 'rejected', 'deferred'))`
+  );
+  ensureColumn('fragments', 'defer_reason', 'defer_reason TEXT');
 }

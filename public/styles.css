@@ -185,6 +185,71 @@ textarea { width: 100%; resize: vertical; font-family: inherit; }
 .badge.st-open          { background: var(--open-bg);     color: var(--open-fg); }
 .badge.st-resolved      { background: var(--resolved-bg); color: var(--resolved-fg); }
 .badge.st-pending_review { background: var(--pending-bg); color: var(--pending-fg); }
+.badge.dc-accepted { background: var(--resolved-bg); color: var(--resolved-fg); }
+.badge.dc-rejected { background: var(--pending-bg);  color: var(--pending-fg); }
+.badge.dc-deferred { background: var(--open-bg);     color: var(--open-fg); }
+.badge.sealed { background: #e2e8f0; color: #334155; }
+.badge.draft  { background: var(--open-bg); color: var(--open-fg); }
+
+.chip.dc-undecided { background: #f1f5f9; color: #475569; border-color: #cbd5e1; }
+
+/* 片段结论 */
+.decision-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+}
+.decision-title { color: var(--dim); }
+.dc-opt { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.dc-opt input { margin: 0; }
+.defer-input { flex: 1; min-width: 220px; padding: 5px 10px; font-size: 13px; }
+
+.decision-view {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 14px;
+}
+
+/* 审阅封存 */
+.seal-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  background: #f8fafc;
+}
+.seal-status { margin-bottom: 10px; font-size: 14px; }
+.seal-form { display: flex; gap: 10px; flex-wrap: wrap; }
+.seal-form input { width: 200px; }
+.seal-banner {
+  border: 1px solid #94a3b8;
+  background: #e2e8f0;
+  color: #334155;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  font-size: 14px;
+}
+.blocker-box {
+  border: 1px solid var(--removed-border);
+  background: var(--pending-bg);
+  color: var(--pending-fg);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+.blocker-box ul { margin: 6px 0 0; padding-left: 20px; }
 
 .frag-text {
   margin: 6px 0;

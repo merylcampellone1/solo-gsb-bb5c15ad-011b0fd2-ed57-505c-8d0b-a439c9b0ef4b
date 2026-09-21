@@ -6,6 +6,11 @@ const STATUS_LABEL: Record<string, string> = {
   resolved: '已解决',
   pending_review: '待复核',
 };
+const DECISION_LABEL: Record<string, string> = {
+  accepted: '接受变更',
+  rejected: '拒绝变更',
+  deferred: '暂缓',
+};
 
 export function typeLabel(t: string): string {
   return TYPE_LABEL[t] ?? t;
@@ -15,6 +20,10 @@ export function statusLabel(s: string): string {
   return STATUS_LABEL[s] ?? s;
 }
 
+export function decisionLabel(d: string | null): string {
+  return d == null ? '未作结论' : DECISION_LABEL[d] ?? d;
+}
+
 function csvCell(v: unknown): string {
   const s = v == null ? '' : String(v);
   return `"${s.replace(/"/g, '""')}"`;
@@ -22,9 +31,14 @@ function csvCell(v: unknown): string {
 
 /** 导出 CSV（带 BOM，方便 Excel 直接打开中文） */
 export function toCsv(detail: ComparisonDetail): string {
+  const { comparison } = detail;
+  const sealedBy = comparison.sealed ? comparison.sealed_by ?? '' : '';
+  const sealedAt = comparison.sealed ? comparison.sealed_at ?? '' : '';
   const header = [
     '片段序号',
     '片段类型',
+    '片段结论',
+    '暂缓理由',
     '旧文本',
     '新文本',
     '批注作者',
@@ -32,12 +46,16 @@ export function toCsv(detail: ComparisonDetail): string {
     '批注状态',
     '迁移相似度',
     '批注更新时间',
+    '封存人',
+    '封存时间',
   ];
   const rows: string[] = [header.map(csvCell).join(',')];
 
   const pushRow = (
     ord: number | string,
     type: string,
+    decision: string,
+    deferReason: string,
     oldText: string | null,
     newText: string | null,
     a?: { author: string; content: string; status: string; similarity: number | null; updated_at: string }
@@ -46,6 +64,8 @@ export function toCsv(detail: ComparisonDetail): string {
       [
         ord,
         type,
+        decision,
+        deferReason,
         oldText ?? '',
         newText ?? '',
         a?.author ?? '',
@@ -53,6 +73,8 @@ export function toCsv(detail: ComparisonDetail): string {
         a ? statusLabel(a.status) : '',
         a?.similarity != null ? a.similarity.toFixed(3) : '',
         a?.updated_at ?? '',
+        sealedBy,
+        sealedAt,
       ]
         .map(csvCell)
         .join(',')
@@ -60,16 +82,18 @@ export function toCsv(detail: ComparisonDetail): string {
   };
 
   for (const f of detail.fragments) {
+    const decision = decisionLabel(f.decision);
+    const deferReason = f.decision === 'deferred' ? f.defer_reason ?? '' : '';
     if (f.annotations.length === 0) {
-      pushRow(f.ord, typeLabel(f.type), f.old_text, f.new_text);
+      pushRow(f.ord, typeLabel(f.type), decision, deferReason, f.old_text, f.new_text);
     } else {
       for (const a of f.annotations) {
-        pushRow(f.ord, typeLabel(f.type), f.old_text, f.new_text, a);
+        pushRow(f.ord, typeLabel(f.type), decision, deferReason, f.old_text, f.new_text, a);
       }
     }
   }
   for (const a of detail.unanchored) {
-    pushRow('-', '待复核（未匹配片段）', a.anchor_text, '', a);
+    pushRow('-', '待复核（未匹配片段）', '', '', a.anchor_text, '', a);
   }
 
   return '﻿' + rows.join('\r\n');
@@ -88,6 +112,12 @@ export function toMarkdown(detail: ComparisonDetail): string {
   );
   lines.push(
     `- 批注统计：待处理 ${stats.annotations.open} · 已解决 ${stats.annotations.resolved} · 待复核 ${stats.annotations.pending_review}（共 ${stats.annotations.total} 条）`
+  );
+  lines.push(`- 未作结论片段：${stats.undecided} 个`);
+  lines.push(
+    comparison.sealed
+      ? `- 封存状态：已封存（封存人：${comparison.sealed_by ?? '未知'}，封存时间：${comparison.sealed_at ?? '未知'}）`
+      : '- 封存状态：草稿（未封存）'
   );
   lines.push('');
   lines.push('---');
@@ -109,6 +139,10 @@ export function toMarkdown(detail: ComparisonDetail): string {
   for (const f of fragments) {
     lines.push('');
     lines.push(`## 片段 #${f.ord}（${typeLabel(f.type)}）`);
+    lines.push('');
+    const deferSuffix =
+      f.decision === 'deferred' && f.defer_reason ? `——理由：${f.defer_reason}` : '';
+    lines.push(`**结论**：${decisionLabel(f.decision)}${deferSuffix}`);
     lines.push('');
     if (f.old_text != null) {
       lines.push('**旧文本**');

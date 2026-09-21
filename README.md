@@ -1,6 +1,6 @@
 # 条文变更审阅台
 
-一个用于**规范 / 制度文本版本审阅**的网页应用：粘贴同一规范的前后版本，系统按段落自动计算差异（新增 / 删除 / 修改），审阅人员可在差异片段上创建带作者与状态的批注；当后续版本再次导入时，系统基于**文本锚点**把未解决的批注自动迁移到最相近的新片段，无法匹配的批注标记为「待复核」。支持批注筛选、状态流转与审阅结果导出（JSON / CSV / Markdown）。
+一个用于**规范 / 制度文本版本审阅**的网页应用：粘贴同一规范的前后版本，系统按段落自动计算差异（新增 / 删除 / 修改），审阅人员可在差异片段上创建带作者与状态的批注；当后续版本再次导入时，系统基于**文本锚点**把未解决的批注自动迁移到最相近的新片段，无法匹配的批注标记为「待复核」。每个差异片段需给出审阅结论（接受变更 / 拒绝变更 / 暂缓），全部片段有结论且批注清零后可**封存**本轮比对（封存后只读）。支持批注筛选、状态流转与审阅结果导出（JSON / CSV / Markdown）。
 
 ## 技术栈
 
@@ -39,7 +39,7 @@ APP_PORT=8080 docker compose up --build   # 访问 http://localhost:8080
 ```bash
 npm install        # 安装依赖（better-sqlite3 为原生模块，需编译环境）
 npm run dev        # 编译并启动，默认 http://localhost:3000
-npm test           # 编译并运行单元测试（差异引擎 + 批注迁移）
+npm test           # 编译并运行单元测试（差异引擎 + 批注迁移 + 审阅封存）
 npm start          # 仅启动（需先 npm run build）
 ```
 
@@ -50,7 +50,20 @@ npm start          # 仅启动（需先 npm run build）
 3. **查看差异**：导入第二个版本起自动生成比对，片段按「新增 / 删除 / 修改」着色展示。
 4. **创建批注**：在片段上填写作者与审阅意见，状态流转为 `待处理 → 已解决`，也可手动标记 `待复核`。
 5. **导入后续版本**：未解决批注按文本锚点自动迁移到最相近的新片段；无法匹配的进入页面顶部「待复核」区域。
-6. **筛选与导出**：按状态 / 作者筛选批注，一键导出 JSON / CSV / Markdown 审阅报告。
+6. **片段结论**：每个差异片段必须选择「接受变更 / 拒绝变更 / 暂缓」之一；选择「暂缓」时必须填写理由。页面顶部实时显示未作结论片段数与未解决、待复核批注数。
+7. **封存比对**：全部片段已有结论且不存在未解决、待复核批注时，填写封存人并点击「封存本轮比对」。服务端会在事务内再次校验，不满足时返回具体阻塞项。封存后片段结论与批注全部锁定。
+8. **筛选与导出**：按状态 / 作者筛选批注，一键导出 JSON / CSV / Markdown 审阅报告（含各片段结论、暂缓理由、封存人与封存时间）。项目页的比对卡片会标识「草稿」或「已封存」。
+
+## 审阅封存规则
+
+- **片段结论**：`accepted`（接受变更）、`rejected`（拒绝变更）、`deferred`（暂缓，必填理由）；未选择即为「未作结论」。
+- **封存条件**（服务端在事务内再次校验）：
+  1. 全部差异片段均已有结论；
+  2. 不存在 `待处理`（open）批注；
+  3. 不存在 `待复核`（pending_review）批注。
+- 不满足时 `POST /api/comparisons/:id/seal` 返回 **409**，响应体 `blockers` 列出具体阻塞项（未作结论的片段序号、阻塞批注明细）。
+- **封存后**：片段结论不可修改；批注不可新增、编辑、改状态或删除（相关接口返回 409）。封存不可撤销。
+- 封存不影响继续导入新版本：已解决批注本就不参与迁移，新比对独立生成、互不影响。
 
 ## 批注迁移规则
 
@@ -66,16 +79,19 @@ npm start          # 仅启动（需先 npm run build）
 | ---- | ---- | ---- |
 | GET | `/api/health` | 健康检查 |
 | GET / POST | `/api/projects` | 项目列表 / 新建项目 `{name}` |
-| GET / DELETE | `/api/projects/:id` | 项目详情（含版本与比对）/ 删除项目 |
+| GET / DELETE | `/api/projects/:id` | 项目详情（含版本与比对，比对带封存状态）/ 删除项目 |
 | POST | `/api/projects/:id/versions` | 导入版本 `{label, content}`，自动比对并迁移批注 |
-| GET | `/api/comparisons/:id` | 比对详情（片段 + 批注 + 统计） |
+| GET | `/api/comparisons/:id` | 比对详情（片段含结论 + 批注 + 统计 + 封存信息） |
 | GET | `/api/comparisons/:id/annotations?status=&author=` | 批注筛选 |
-| POST | `/api/fragments/:id/annotations` | 新建批注 `{author, content}` |
-| PATCH / DELETE | `/api/annotations/:id` | 更新状态或内容 `{status?, content?}` / 删除 |
-| GET | `/api/comparisons/:id/export?format=json\|csv\|md` | 导出审阅结果 |
+| POST | `/api/fragments/:id/annotations` | 新建批注 `{author, content}`（已封存返回 409） |
+| PATCH / DELETE | `/api/annotations/:id` | 更新状态或内容 `{status?, content?}` / 删除（已封存返回 409） |
+| PATCH | `/api/fragments/:id/decision` | 设置片段结论 `{decision, deferReason?}`（已封存返回 409） |
+| POST | `/api/comparisons/:id/seal` | 封存比对 `{sealedBy}`，不满足条件返回 409 及 `blockers` |
+| GET | `/api/comparisons/:id/export?format=json\|csv\|md` | 导出审阅结果（含结论、暂缓理由、封存人与时间） |
 | POST | `/api/demo` | 载入示例数据 |
 
 批注状态：`open`（待处理）、`resolved`（已解决）、`pending_review`（待复核）。
+片段结论：`accepted`（接受变更）、`rejected`（拒绝变更）、`deferred`（暂缓，必填 `deferReason`）。
 
 ## 目录结构
 

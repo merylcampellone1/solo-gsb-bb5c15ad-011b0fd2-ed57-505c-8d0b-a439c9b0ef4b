@@ -5,7 +5,12 @@ import {
   createProject,
   importVersion,
   addAnnotation,
+  updateAnnotation,
+  deleteAnnotation,
   getComparisonDetail,
+  setFragmentDecision,
+  sealComparison,
+  ServiceError,
 } from './service';
 import { toCsv, toMarkdown } from './exporter';
 import { seedDemo } from './demo';
@@ -65,7 +70,7 @@ app.get('/api/projects/:id', (req, res) => {
     .all(id);
   const comparisons = db
     .prepare(
-      `SELECT c.id, c.created_at,
+      `SELECT c.id, c.created_at, c.sealed, c.sealed_by, c.sealed_at,
               ov.label AS old_label, nv.label AS new_label,
               (SELECT COUNT(*) FROM fragments f WHERE f.comparison_id = c.id)  AS fragment_count,
               (SELECT COUNT(*) FROM annotations a WHERE a.comparison_id = c.id) AS annotation_count,
@@ -152,11 +157,6 @@ app.post('/api/fragments/:id/annotations', (req, res) => {
 
 app.patch('/api/annotations/:id', (req, res) => {
   const id = Number(req.params.id);
-  const ann = db.prepare('SELECT * FROM annotations WHERE id = ?').get(id) as
-    | { id: number; status: string; content: string }
-    | undefined;
-  if (!ann) return notFound(res, '批注不存在');
-
   const { status, content } = req.body ?? {};
   if (status === undefined && content === undefined) {
     return badRequest(res, '至少提供 status 或 content 之一');
@@ -167,22 +167,31 @@ app.patch('/api/annotations/:id', (req, res) => {
   if (content !== undefined && !String(content).trim()) {
     return badRequest(res, '批注内容不能为空');
   }
-  db.prepare(
-    `UPDATE annotations
-        SET status = ?, content = ?, updated_at = datetime('now', 'localtime')
-      WHERE id = ?`
-  ).run(
-    status ?? ann.status,
-    content !== undefined ? String(content).trim() : ann.content,
-    id
-  );
-  res.json({ annotation: db.prepare('SELECT * FROM annotations WHERE id = ?').get(id) });
+  const annotation = updateAnnotation(db, id, {
+    status,
+    content: content !== undefined ? String(content).trim() : undefined,
+  });
+  res.json({ annotation });
 });
 
 app.delete('/api/annotations/:id', (req, res) => {
-  const info = db.prepare('DELETE FROM annotations WHERE id = ?').run(Number(req.params.id));
-  if (info.changes === 0) return notFound(res, '批注不存在');
+  deleteAnnotation(db, Number(req.params.id));
   res.status(204).end();
+});
+
+// ---------- 片段结论与审阅封存 ----------
+app.patch('/api/fragments/:id/decision', (req, res) => {
+  const { decision, deferReason } = req.body ?? {};
+  const fragment = setFragmentDecision(db, Number(req.params.id), String(decision ?? ''), deferReason);
+  res.json({ fragment });
+});
+
+app.post('/api/comparisons/:id/seal', (req, res) => {
+  const sealedBy = String(req.body?.sealedBy ?? '').trim();
+  if (!sealedBy) return badRequest(res, '封存人必填');
+  if (sealedBy.length > 50) return badRequest(res, '封存人名称过长');
+  const sealed = sealComparison(db, Number(req.params.id), sealedBy);
+  res.json({ sealed });
 });
 
 // ---------- 导出 ----------
@@ -226,6 +235,9 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api', (_req, res) => res.status(404).json({ error: '接口不存在' }));
 app.use(
   (err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err instanceof ServiceError) {
+      return res.status(err.status).json({ error: err.message, ...err.extra });
+    }
     console.error(err);
     res.status(500).json({ error: '服务器内部错误' });
   }
